@@ -7,7 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 1.20.0
-requirements: google-genai==1.16.1
+requirements: google-genai==1.19.0
 """
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API and Vertex AI.
@@ -36,6 +36,8 @@ requirements: google-genai==1.16.1
 
 from google import genai
 from google.genai import types
+from google.cloud import storage
+from google.api_core import exceptions
 
 import inspect
 import copy
@@ -71,10 +73,50 @@ from open_webui.storage.provider import Storage
 if TYPE_CHECKING:
     from loguru import Record
     from loguru._handler import Handler  # type: ignore
-    from utils.manifold_types import *  # My personal types in a separate file for more robustness.
+    from open_webui.utils.manifold_types import *  # My personal types in a separate file for more robustness.
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
+
+# These tags will be "disabled" in the response, meaning that they will not be parsed by the backend.
+SPECIAL_TAGS_TO_DISABLE = [
+    "details",
+    "think",
+    "thinking",
+    "reason",
+    "reasoning",
+    "thought",
+    "Thought",
+    "|begin_of_thought|",
+    "code_interpreter",
+    "|begin_of_solution|",
+]
+ZWS = "\u200b"
+
+DEFAULT_FIXED_MODELS_LIST = [
+    {
+        "id": "gemini",
+        "provider_id": "gemini-2.5-flash",
+        "name": "Gemini",
+    },
+    {
+        "id": "gemini_pro",
+        "provider_id": "gemini-2.5-pro",
+        "name": "Gemini Pro",
+    },
+    {
+        "id": "vseved",
+        "provider_id": "gemini-2.5-pro",
+        "name": "Wiki Vševěd",
+        "tools": ["grounding"],
+        "datastores": [
+            "projects/l-plat-datadsa-alzagen/locations/eu/collections/default_collection/dataStores/alzagen-wiki-pojmy-ds-demo"
+        ],
+    },
+]
+
+# Convert the list to a JSON string for the default value
+DEFAULT_FIXED_MODELS_JSON = json.dumps(DEFAULT_FIXED_MODELS_LIST)
 
 
 class GenaiApiError(Exception):
@@ -170,6 +212,14 @@ class Pipe:
             default=False,
             description="Enable the URL context tool to allow the model to fetch and use content from provided URLs. This tool is only compatible with specific models.",
         )
+        USE_FIXED_MODELS: bool = Field(
+            default=True,
+            description="Whether to use models defined in FIXED_MODELS instead of fetching models from Google. Easier transitions to newer model versions without the need to update workspace models.",
+        )
+        FIXED_MODELS: str = Field(
+            default=DEFAULT_FIXED_MODELS_JSON,
+            description="A list of models to use, including id (e.g. gemini), provider_id (e.g. gemini-2.5-flash-preview-05-20), name (e.g. Gemini)",
+        )
 
     class UserValves(BaseModel):
         # TODO: Add more options that can be changed by the user.
@@ -211,7 +261,7 @@ class Pipe:
             Default value is None.""",
         )
         ENABLE_URL_CONTEXT_TOOL: bool = Field(
-            default=False,
+            default=None,
             description="Enable the URL context tool to allow the model to fetch and use content from provided URLs. This tool is only compatible with specific models.",
         )
 
@@ -232,6 +282,14 @@ class Pipe:
         """Register all available Google models."""
         self._add_log_handler(self.valves.LOG_LEVEL)
 
+        if self.valves.USE_FIXED_MODELS:
+            if not self.valves.FIXED_MODELS:
+                log.warning(
+                    "USE_FIXED_MODELS is True, but FIXED_MODELS string is empty. Returning no models."
+                )
+                return []
+            models_data = json.loads(self.valves.FIXED_MODELS)
+            return models_data
         # Clear cache if caching is disabled
         if not self.valves.CACHE_MODELS:
             log.debug("CACHE_MODELS is False, clearing model cache.")
@@ -260,7 +318,7 @@ class Pipe:
         __request__: Request,
         __event_emitter__: Callable[["Event"], Awaitable[None]],
         __metadata__: dict[str, Any],
-    ) -> AsyncGenerator | str | None:
+    ) -> AsyncGenerator[dict, None] | str:
         self._add_log_handler(self.valves.LOG_LEVEL)
 
         # Apply settings from the user
@@ -317,13 +375,21 @@ class Pipe:
             features.get("upload_documents", False),
             __event_emitter__,
         )
-
         # Assemble GenerateContentConfig
         safety_settings: list[types.SafetySetting] | None = __metadata__.get(
             "safety_settings"
         )
         model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
-
+        model_tools = None
+        datastores = None
+        if self.valves.USE_FIXED_MODELS:
+            models_data = json.loads(self.valves.FIXED_MODELS)
+            for model in models_data:
+                if model_name == model.get("id", ""):
+                    model_name = model.get("provider_id", model_name)
+                    model_tools = model.get("tools", [])
+                    datastores = model.get("datastores", [])
+                    break
         thinking_conf = None
         if re.search(self.valves.THINKING_MODEL_PATTERN, model_name, re.IGNORECASE):
             log.info(f"Model ID '{model_name}' allows adjusting the thinking settings.")
@@ -344,10 +410,10 @@ class Pipe:
         )
         gen_content_conf.response_modalities = ["Text"]
         if (
-            "gemini-2.0-flash-exp-image-generation" in model_name
+            "gemini-2.0-flash-preview-image-generation" in model_name
             or "gemma" in model_name
         ):
-            if "gemini-2.0-flash-exp-image-generation" in model_name:
+            if "gemini-2.0-flash-preview-image-generation" in model_name:
                 gen_content_conf.response_modalities.append("Image")
             # TODO: append to user message instead.
             if gen_content_conf.system_instruction:
@@ -356,38 +422,40 @@ class Pipe:
                     "Image Generation model does not support the system prompt message! Removing the system prompt."
                 )
         gen_content_conf.tools = []
-
         # Add URL context tool if enabled and model is compatible
-        if valves.ENABLE_URL_CONTEXT_TOOL:
+        if "grounding" in model_tools:
+            if datastores:
+                for datastore in datastores:
+                    gen_content_conf.tools.append(
+                        types.Tool(
+                            retrieval=types.Retrieval(
+                                vertex_ai_search=types.VertexAISearch(
+                                    datastore=datastore
+                                )
+                            )
+                        ),
+                    )
+        if features.get("google_search_tool"):
+            log.info("Using grounding with Google Search as a Tool.")
+            gen_content_conf.tools.append(
+                types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
+            )
+        if valves.ENABLE_URL_CONTEXT_TOOL and (
+            (len(gen_content_conf.tools) == 0) or not self.valves.USE_VERTEX_AI
+        ):
             compatible_models_for_url_context = [
-                "gemini-2.5-pro-preview-05-06",
-                "gemini-2.5-flash-preview-05-20",
-                "gemini-2.0-flash",
-                "gemini-2.0-flash-001",
-                "gemini-2.0-flash-live-001",
+                "gemini-2.5-pro",
+                "gemini-2.5-flash",
             ]
             if model_name in compatible_models_for_url_context:
-                if client.vertexai:
-                    log.warning(
-                        "URL context tool is enabled, but Vertex AI does not support it. Skipping."
-                    )
-                else:
-                    log.info(
-                        f"Model {model_name} is compatible with URL context tool. Enabling."
-                    )
-                    gen_content_conf.tools.append(
-                        types.Tool(url_context=types.UrlContext())
-                    )
+                gen_content_conf.tools.append(
+                    types.Tool(url_context=types.UrlContext())
+                )
             else:
                 log.warning(
                     f"URL context tool is enabled, but model {model_name} is not in the compatible list. Skipping."
                 )
 
-        if features.get("google_search_tool"):
-            log.info("Using grounding with Google Search as a Tool.")
-            gen_content_conf.tools.append(
-                types.Tool(google_search=types.GoogleSearch())
-            )
         elif features.get("google_search_retrieval"):
             log.info("Using grounding with Google Search Retrieval.")
             gs = types.GoogleSearchRetrieval(
@@ -409,7 +477,6 @@ class Pipe:
             "config": gen_content_conf,
         }
         log.debug("Passing these args to the Google API:", payload=gen_content_args)
-
         if body.get("stream", False):
             # Streaming response
             response_stream: AsyncIterator[types.GenerateContentResponse] = (
@@ -419,7 +486,6 @@ class Pipe:
             return self._stream_response_generator(
                 response_stream,
                 __request__,
-                valves,
                 gen_content_args,
                 __event_emitter__,
                 __metadata__,
@@ -544,7 +610,7 @@ class Pipe:
         self,
         api_key: str | None,
         base_url: str | None,
-        use_vertex_ai: bool | None,  # User's preference from config
+        use_vertex_ai: bool | None,  # User's preference from open_webui.config
         vertex_project: str | None,
         vertex_location: str | None,
         whitelist_str: str,
@@ -868,6 +934,25 @@ class Pipe:
                     if upload_documents:
                         files = message_db.get("files", [])
                 parts = await self._process_user_message(message, files, event_emitter)
+                has_text_component = any(p.text for p in parts if p.text)
+
+                if not has_text_component:
+                    # This condition is met if:
+                    # 1. 'parts' is empty (user sent absolutely nothing).
+                    # 2. 'parts' contains non-text items (e.g., an image) but no text part.
+                    log.info(
+                        "User input is empty or lacks a text component (e.g., image-only). "
+                        "Adding default text prompt."
+                    )
+                    default_prompt_text = "Uživatel zapomněl odeslat dotaz s nově přidaným kontextem. Odpověz shrnutím toho, co vidíš v nejnovějším přiloženém kontextu."
+                    default_text_parts = self._genai_parts_from_text(
+                        default_prompt_text
+                    )
+
+                    # Append the default text part(s) to the existing 'parts' list.
+                    # If 'parts' was empty, it becomes the default text.
+                    # If 'parts' had an image, text is added alongside it.
+                    parts.extend(default_text_parts)
             elif role == "assistant":
                 message = cast("AssistantMessage", message)
                 # Google API's assistant role is "model"
@@ -988,7 +1073,42 @@ class Pipe:
             log.exception(f"Error processing image URL: {image_url[:64]}[...]")
             return None
 
+    @staticmethod
+    def _enable_special_tags(text: str) -> str:
+        """
+        Reverses the action of _disable_special_tags by removing the ZWS
+        from special tags. This is used to clean up history messages before
+        sending them to the model, so it can understand the context correctly.
+        """
+        if not text:
+            return ""
+
+        # The regex finds '<ZWS' followed by an optional '/' and then one of the special tags.
+        # The inner parentheses group the tags, so the optional '/' applies to all of them.
+        REVERSE_TAG_REGEX = re.compile(
+            r"<"
+            + ZWS
+            + r"(/?"
+            + "("
+            + "|".join(re.escape(tag) for tag in SPECIAL_TAGS_TO_DISABLE)
+            + ")"
+            + r")"
+        )
+        # The substitution restores the original tag, e.g., '<ZWS/think' becomes '</think'.
+        restored_text, count = REVERSE_TAG_REGEX.subn(r"<\1", text)
+        if count > 0:
+            log.debug(f"Re-enabled {count} special tag(s) for model context.")
+
+        return restored_text
+
     def _genai_parts_from_text(self, text: str) -> list[types.Part]:
+        if not text:
+            return []
+
+        # Restore special tags that were disabled for front-end safety.
+        # This ensures the model receives the original, intended text.
+        text = self._enable_special_tags(text)
+
         parts: list[types.Part] = []
         last_pos = 0
 
@@ -1085,87 +1205,119 @@ class Pipe:
     # endregion 1.3 Open WebUI's body.messages -> list[genai.types.Content] conversion
 
     # region 1.4 Model response streaming
-    async def _stream_response_generator(
+    async def _process_parts_to_structured_stream(
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
         __request__: Request,
-        valves: "Pipe.Valves",
         gen_content_args: dict,
-        event_emitter: Callable[["Event"], Awaitable[None]],
-        metadata: dict[str, Any],
         user_id: str,
-    ) -> AsyncGenerator[str, None]:
+    ) -> AsyncGenerator[tuple[dict, int, types.GenerateContentResponse | None], None]:
         """
-        Yields text chunks from the stream and spawns metadata processing task on completion.
+        Processes a stream of Gemini responses, yielding structured dictionaries,
+        a substitution count for the ZWS safeguard, and the raw chunk.
         """
-        final_response_chunk: types.GenerateContentResponse | None = None
-        error_occurred = False
-        is_think_tag_opened = False
-
         try:
             async for chunk in response_stream:
-                final_response_chunk = chunk
-
                 if not (candidate := self._get_first_candidate(chunk.candidates)):
                     log.warning("Stream chunk has no candidates, skipping.")
                     continue
                 if not (parts := candidate.content and candidate.content.parts):
-                    log.warning(
-                        "candidate does not contain content or content.parts, skipping."
-                    )
+                    log.warning("Candidate has no content parts, skipping.")
                     continue
-                # Process parts and yield text
-                for part in parts:
-                    # To my knowledge it's not possible for a part to have multiple fields below at the same time.
-                    if part.text:
-                        if part.thought:
-                            thinking_text = part.text
-                            if not is_think_tag_opened:
-                                is_think_tag_opened = True
-                                thinking_text = f"<think>{thinking_text}"
-                            yield thinking_text
-                            continue
 
-                        result_text = part.text
-                        if is_think_tag_opened:
-                            is_think_tag_opened = False
-                            result_text = f"</think>{result_text}"
-                        yield result_text
-                    elif part.inline_data:
-                        # _process_image_part returns a Markdown URL.
-                        yield (
-                            self._process_image_part(
-                                part.inline_data,
-                                gen_content_args,
-                                user_id,
-                                __request__,
+                for part in parts:
+                    # Initialize variables at the start of each loop to satisfy the linter
+                    # and ensure they always have a defined state.
+                    payload: dict | None = None
+                    count: int = 0
+                    key: str = "content"
+
+                    match part:
+                        case types.Part(text=str(text), thought=True):
+                            # It's a thought, so we'll use the "reasoning" key.
+                            key = "reasoning"
+                            sanitized_text, count = self._disable_special_tags(text)
+                            payload = {key: sanitized_text}
+                        case types.Part(text=str(text)):
+                            # It's regular content, using the default "content" key.
+                            sanitized_text, count = self._disable_special_tags(text)
+                            payload = {key: sanitized_text}
+                        case types.Part(inline_data=data):
+                            # Image parts don't need tag disabling.
+                            processed_text = self._process_image_part(
+                                data, gen_content_args, user_id, __request__
                             )
-                            or ""
-                        )
-                    elif part.executable_code:
-                        yield (
-                            self._process_executable_code_part(part.executable_code)
-                            or ""
-                        )
-                    elif part.code_execution_result:
-                        yield (
-                            self._process_code_execution_result_part(
-                                part.code_execution_result
+                            if processed_text:
+                                payload = {"content": processed_text}
+                        case types.Part(executable_code=code):
+                            processed_text = self._process_executable_code_part(code)
+                            # Code blocks are already formatted and safe.
+                            if processed_text:
+                                payload = {"content": processed_text}
+                        case types.Part(code_execution_result=result):
+                            processed_text = self._process_code_execution_result_part(
+                                result
                             )
-                            or ""
-                        )
+                            # Code results are also safe.
+                            if processed_text:
+                                payload = {"content": processed_text}
+
+                    if payload:
+                        structured_chunk = {"choices": [{"delta": payload}]}
+                        yield structured_chunk, count, chunk
+        except Exception:
+            raise
+
+    async def _stream_response_generator(
+        self,
+        response_stream: AsyncIterator[types.GenerateContentResponse],
+        __request__: Request,
+        gen_content_args: dict,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        metadata: dict[str, Any],
+        user_id: str,
+    ) -> AsyncGenerator[dict, None]:
+        """
+        Yields structured dictionary chunks from the stream, counts tag substitutions
+        for a final toast notification, and handles post-processing.
+        """
+        final_response_chunk: types.GenerateContentResponse | None = None
+        error_occurred = False
+        total_substitutions = 0
+
+        try:
+            part_processor = self._process_parts_to_structured_stream(
+                response_stream, __request__, gen_content_args, user_id
+            )
+            async for structured_chunk, count, raw_chunk in part_processor:
+                if count > 0:
+                    total_substitutions += count
+                    log.debug(f"Disabled {count} special tag(s) in a chunk.")
+
+                if raw_chunk:
+                    final_response_chunk = raw_chunk
+                yield structured_chunk
+
         except Exception as e:
             error_occurred = True
             error_msg = f"Stream ended with error: {e}"
+            # FIXME: raise the error instead?
             await self._emit_error(error_msg, event_emitter)
         finally:
+            if total_substitutions > 0 and not error_occurred:
+                plural_s = "s" if total_substitutions > 1 else ""
+                toast_msg = (
+                    f"For clarity, {total_substitutions} special tag{plural_s} "
+                    "were disabled in the response by injecting a zero-width space (ZWS)."
+                )
+                await self._emit_toast(toast_msg, event_emitter, "info")
+
             if not error_occurred:
-                log.info(f"Stream finished successfully!")
+                log.info("Stream finished successfully!")
                 log.debug("Last chunk:", payload=final_response_chunk)
+
             try:
-                # Catch and emit any errors that might happen here as a toast message.
                 await self._do_post_processing(
-                    # Metadata about the model response is always in the final chunk of the stream.
                     final_response_chunk,
                     event_emitter,
                     metadata,
@@ -1174,10 +1326,33 @@ class Pipe:
                 )
             except Exception as e:
                 error_msg = f"Post-processing failed with error:\n\n{e}"
-                # Using toast here in order to keep the inital AI response untouched.
                 await self._emit_toast(error_msg, event_emitter, "error")
                 log.exception(error_msg)
+
             log.debug("AsyncGenerator finished.")
+
+    @staticmethod
+    def _disable_special_tags(text: str) -> tuple[str, int]:
+        """
+        Finds special tags in a text chunk and inserts a Zero-Width Space (ZWS)
+        to prevent them from being parsed by the Open WebUI backend's legacy system.
+        This is a safeguard against accidental tag generation by the model.
+        """
+        if not text:
+            return "", 0
+
+        # The regex finds '<' followed by an optional '/' and then one of the special tags.
+        # The inner parentheses group the tags, so the optional '/' applies to all of them.
+        TAG_REGEX = re.compile(
+            r"<(/?"
+            + "("
+            + "|".join(re.escape(tag) for tag in SPECIAL_TAGS_TO_DISABLE)
+            + ")"
+            + r")"
+        )
+        # The substitution injects a ZWS, e.g., '</think>' becomes '<ZWS/think'.
+        modified_text, num_substitutions = TAG_REGEX.subn(rf"<{ZWS}\1", text)
+        return modified_text, num_substitutions
 
     def _process_image_part(
         self, inline_data, gen_content_args: dict, user_id: str, request: Request
@@ -1536,6 +1711,7 @@ class Pipe:
         event_emitter: Callable[["Event"], Awaitable[None]],
         toastType: Literal["info", "success", "warning", "error"] = "info",
     ) -> None:
+        """Emits a toast notification to the front-end."""
         # TODO: Use this method in more places, even for info toasts.
         event: NotificationEvent = {
             "type": "notification",
@@ -1887,6 +2063,34 @@ class Pipe:
                 f"File {file_path} was found in the database but it lacks `meta.content_type` field. Cannot continue."
             )
             return None, None
+        if file_path.startswith("gs://"):
+            try:
+                # Initialize the GCS client
+                storage_client = storage.Client()
+
+                # Parse the GCS path
+                # The path should be in the format "gs://bucket-name/object-name"
+                if len(file_path.split("/", 3)) < 4:
+                    raise ValueError(
+                        f"Invalid GCS path: '{file_path}'. "
+                        "Path must be in the format 'gs://bucket-name/object-name'."
+                    )
+
+                bucket_name, blob_name = file_path.removeprefix("gs://").split("/", 1)
+
+                # Get the bucket and blob (file object)
+                bucket = storage_client.bucket(bucket_name)
+                blob = bucket.blob(blob_name)
+
+                # Download the file's content as bytes
+                print(f"Reading from GCS: {file_path}")
+                return blob.download_as_bytes(), content_type
+            except exceptions.NotFound:
+                print(f"Error: GCS object not found at {file_path}")
+                raise
+            except Exception as e:
+                print(f"An error occurred while reading from GCS: {e}")
+                raise
         try:
             with open(file_path, "rb") as file:
                 image_data = file.read()
