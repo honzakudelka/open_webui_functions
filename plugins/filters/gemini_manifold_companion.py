@@ -7,6 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 1.5.0
+requirements: google-genai==1.16.1
 """
 
 # This filter can detect that a feature like web search or code execution is enabled in the front-end,
@@ -33,38 +34,22 @@ from open_webui.models.functions import Functions
 if TYPE_CHECKING:
     from loguru import Record
     from loguru._handler import Handler  # type: ignore
-    from utils.manifold_types import *  # My personal types in a separate file for more robustness.
+    from open_webui.utils.manifold_types import *  # My personal types in a separate file for more robustness.
 
 # According to https://ai.google.dev/gemini-api/docs/models
 ALLOWED_GROUNDING_MODELS = {
-    "gemini-2.5-flash-preview-05-20",
-    "gemini-2.5-pro-preview-05-06",
-    "gemini-2.5-flash-preview-04-17",
-    "gemini-2.5-pro-preview-03-25",
-    "gemini-2.5-pro-exp-03-25",
-    "gemini-2.0-pro-exp",
-    "gemini-2.0-pro-exp-02-05",
-    "gemini-exp-1206",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-exp",
-    "gemini-2.0-flash-001",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash",
-    "gemini-1.0-pro",
+    "gemini",
+    "gemini_pro",
+    "vseved",
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
 }
 ALLOWED_CODE_EXECUTION_MODELS = {
-    "gemini-2.5-flash-preview-05-20",
-    "gemini-2.5-pro-preview-05-06",
-    "gemini-2.5-flash-preview-04-17",
-    "gemini-2.5-pro-preview-03-25",
-    "gemini-2.5-pro-exp-03-25",
-    "gemini-2.0-pro-exp",
-    "gemini-2.0-pro-exp-02-05",
-    "gemini-exp-1206",
-    "gemini-2.0-flash-thinking-exp-01-21",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-exp",
-    "gemini-2.0-flash-001",
+    "gemini",
+    "gemini_pro",
+    "vseved",
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
 }
 
 # Default timeout for URL resolution
@@ -78,9 +63,9 @@ log = logger.bind(auditable=False)
 class Filter:
 
     class Valves(BaseModel):
-        SET_TEMP_TO_ZERO: bool = Field(
+        SET_TEMP_TO_ONE: bool = Field(
             default=False,
-            description="""Decide if you want to set the temperature to 0 for grounded answers, 
+            description="""Decide if you want to set the temperature to 1 for grounded answers, 
             Google reccomends it in their docs.""",
         )
         GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD: float | None = Field(
@@ -172,9 +157,9 @@ class Filter:
                     metadata_features["google_search_tool"] = True
                 # Google suggest setting temperature to 0 if using grounding:
                 # https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-with-google-search#:~:text=For%20ideal%20results%2C%20use%20a%20temperature%20of%200.0.
-                if self.valves.SET_TEMP_TO_ZERO:
-                    log.info("Setting temperature to 0.")
-                    body["temperature"] = 0  # type: ignore
+                if self.valves.SET_TEMP_TO_ONE:
+                    log.info("Setting temperature to 1.")
+                    body["temperature"] = 1  # type: ignore
         if is_code_exec_model:
             code_execution_enabled = (
                 features.get("code_interpreter", False)
@@ -230,7 +215,6 @@ class Filter:
         """Modifies the complete response payload after it's received from the LLM. Operates on the final `body` dictionary."""
 
         log.debug("outlet method has been triggered.")
-
         chat_id: str = __metadata__.get("chat_id", "")
         message_id: str = __metadata__.get("message_id", "")
         storage_key = f"grounding_{chat_id}_{message_id}"
@@ -440,30 +424,24 @@ class Filter:
 
     async def _resolve_and_emit_sources(
         self,
-        grounding_chunks: list[types.GroundingChunk],
-        supports: list[types.GroundingSupport],
-        event_emitter: Callable[["Event"], Awaitable[None]],
+        grounding_chunks: list[
+            types.GroundingChunk
+        ],  # Using your 'types.GroundingChunk'
+        supports: list[types.GroundingSupport],  # Using your 'types.GroundingSupport'
+        event_emitter: Callable[["Event"], Awaitable[None]],  # Using your 'Event' type
     ):
         """
-        Resolves URLs in the background and emits a chat completion event
-        containing only the source information.
+        Resolves URLs for web sources, transforms titles for internal sources,
+        and emits an event containing the source information.
         """
-        # Create initial_metadatas from grounding_chunks
-        initial_metadatas: list[tuple[int, str]] = []
-        for i, g_c in enumerate(grounding_chunks):
-            web_info = g_c.web
-            if web_info and web_info.uri:
-                initial_metadatas.append((i, web_info.uri))
-
-        if not initial_metadatas:
+        if not grounding_chunks:
             log.info(
-                "No source URIs found in grounding_chunks (checked in _resolve_and_emit_sources), "
-                "skipping background URL resolution task."
+                "No grounding_chunks provided, skipping source resolution and emission."
             )
             return
 
-        # Create source_metadatas_template based on grounding_chunks length
-        source_metadatas_template: list["SourceMetadata"] = [
+        # Template for source metadata for each chunk, using the EmittedSourceMetadata TypedDict
+        populated_metadatas: list[EmittedSourceMetadata] = [
             {
                 "source": None,
                 "original_url": None,
@@ -472,70 +450,128 @@ class Filter:
             for _ in grounding_chunks
         ]
 
-        resolved_uris_map = {}
-        try:
-            urls_to_resolve = [url for _, url in initial_metadatas]
-            resolved_uris: list[str] = []
+        web_uris_to_resolve_map: dict[str, int] = {}
+        internal_source_details: list[tuple[int, str, str]] = (
+            []
+        )  # (chunk_index, gs_uri, title_to_transform)
 
-            log.info(f"Resolving {len(urls_to_resolve)} source URLs...")
-            async with aiohttp.ClientSession() as session:
-                tasks = [self._resolve_url(session, url) for url in urls_to_resolve]
-                resolved_uris = await asyncio.gather(*tasks)
-            log.info("URL resolution completed.")
+        for i, g_c in enumerate(grounding_chunks):
+            # Assuming types.GroundingChunk has 'web' and 'retrieved_context' attributes
+            # which can be None, and they in turn have 'uri' and 'title' attributes.
+            web_info = getattr(g_c, "web", None)
+            retrieved_context_info = getattr(g_c, "retrieved_context", None)
 
-            resolved_uris_map = dict(zip(urls_to_resolve, resolved_uris))
-
-        except Exception as e:
-            log.error(f"Error during URL resolution: {e}")
-            resolved_uris_map = {url: url for _, url in initial_metadatas}
-
-        populated_metadatas = [m.copy() for m in source_metadatas_template]
-
-        for chunk_index, original_uri in initial_metadatas:
-            resolved_uri = resolved_uris_map.get(original_uri, original_uri)
-            if 0 <= chunk_index < len(populated_metadatas):
-                populated_metadatas[chunk_index]["original_url"] = original_uri
-                populated_metadatas[chunk_index]["source"] = resolved_uri
+            if web_info and getattr(web_info, "uri", None):
+                web_uri = web_info.uri
+                web_uris_to_resolve_map[web_uri] = i
+                populated_metadatas[i]["original_url"] = web_uri
+            elif (
+                retrieved_context_info
+                and getattr(retrieved_context_info, "uri", None)
+                and getattr(retrieved_context_info, "title", None)
+            ):
+                gs_uri = retrieved_context_info.uri
+                title_to_transform = retrieved_context_info.title
+                internal_source_details.append((i, gs_uri, title_to_transform))
+                populated_metadatas[i]["original_url"] = gs_uri
             else:
                 log.warning(
-                    f"Chunk index {chunk_index} out of bounds when populating resolved URLs."
+                    f"GroundingChunk at index {i} has neither web nor sufficient retrieved_context info. Skipping."
+                )
+
+        resolved_web_uris_map: dict[str, str] = {}
+        if web_uris_to_resolve_map:
+            original_web_uris = list(web_uris_to_resolve_map.keys())
+            log.info(f"Resolving {len(original_web_uris)} web source URLs...")
+            try:
+                async with aiohttp.ClientSession() as session:
+                    tasks = [
+                        self._resolve_url(session, url) for url in original_web_uris
+                    ]
+                    resolved_uris_list = await asyncio.gather(*tasks)
+                resolved_web_uris_map = dict(zip(original_web_uris, resolved_uris_list))
+                log.info("Web URL resolution completed.")
+            except Exception as e:
+                log.error(f"Error during web URL resolution: {e}")
+                for url in original_web_uris:
+                    if url not in resolved_web_uris_map:
+                        resolved_web_uris_map[url] = url
+
+        for original_web_uri, chunk_index in web_uris_to_resolve_map.items():
+            resolved_uri = resolved_web_uris_map.get(original_web_uri, original_web_uri)
+            if 0 <= chunk_index < len(populated_metadatas):
+                populated_metadatas[chunk_index]["source"] = resolved_uri
+            else:
+                log.error(
+                    f"Chunk index {chunk_index} out of bounds when populating resolved web URLs (logic error)."
+                )
+
+        WIKI_PREFIX = "https://wiki/"
+        for chunk_index, _, title_to_transform in internal_source_details:
+            transformed_path = title_to_transform.replace("-", "/", 1)
+            final_internal_url = f"{WIKI_PREFIX}{transformed_path}"
+
+            if 0 <= chunk_index < len(populated_metadatas):
+                populated_metadatas[chunk_index]["source"] = final_internal_url
+            else:
+                log.error(
+                    f"Chunk index {chunk_index} out of bounds when populating transformed internal URLs (logic error)."
                 )
 
         for support in supports:
-            segment = support.segment
-            indices = support.grounding_chunk_indices
-            if not (indices is not None and segment and segment.end_index is not None):
+            # Assuming types.GroundingSupport has 'segment' and 'grounding_chunk_indices' attributes
+            # and segment has 'end_index'. Also assuming it has a 'model_dump()' method.
+            segment = getattr(support, "segment", None)
+            indices = getattr(support, "grounding_chunk_indices", None)
+
+            if not (
+                segment
+                and indices is not None
+                and getattr(segment, "end_index", None) is not None
+            ):
                 continue
+
             for index in indices:
                 if 0 <= index < len(populated_metadatas):
-                    populated_metadatas[index]["supports"].append(support.model_dump())  # type: ignore
+                    # Assuming support object has a model_dump method as per your original code
+                    populated_metadatas[index]["supports"].append(support.model_dump())
                 else:
                     log.warning(
-                        f"Invalid grounding chunk index {index} found in support during background processing."
+                        f"Invalid grounding chunk index {index} found in support during metadata population."
                     )
 
         valid_source_metadatas = [
             m for m in populated_metadatas if m.get("original_url") is not None
         ]
 
-        sources_list: list["Source"] = []
+        emitted_sources_list: list[EmittedSource] = []
         if valid_source_metadatas:
             doc_list = [""] * len(valid_source_metadatas)
-            sources_list.append(
+            source_name_details: SourceDetails = {
+                "name": "web_search"
+            }  # Or make this dynamic
+
+            emitted_sources_list.append(
                 {
-                    "source": {"name": "web_search"},
+                    "source": source_name_details,
                     "document": doc_list,
                     "metadata": valid_source_metadatas,
                 }
             )
 
-        event: "ChatCompletionEvent" = {
-            "type": "chat:completion",
-            "data": {"sources": sources_list},
+        # Construct the event data according to EventDataSources TypedDict
+        event_data: EventDataSources = {"sources": emitted_sources_list}
+
+        # Construct the final event object
+        final_event: Event = {
+            "type": "chat:completion",  # As per your original structure
+            "data": event_data,
         }
-        await event_emitter(event)
-        log.info("Emitted sources event.")
-        log.debug("ChatCompletionEvent:", payload=event)
+        await event_emitter(final_event)
+        log.info(
+            f"Emitted sources event with {len(valid_source_metadatas)} valid sources."
+        )
+        log.debug("Emitted Event data:", payload=final_event["data"])
 
     async def _emit_status_event_w_queries(
         self,
